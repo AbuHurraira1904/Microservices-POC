@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: poc-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: poc
+      POSTGRES_PASSWORD: poc_password
+      POSTGRES_DB: poc_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: poc-rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"    # broker
+      - "15672:15672"  # management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: poc
+      RABBITMQ_DEFAULT_PASS: poc_password
+
+volumes:
+  pg_data:
