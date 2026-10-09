@@ -56,13 +56,14 @@ const pool = new Pool({
 app.post('/orders', async (req, res) => {
   const { sku, quantity } = req.body;
   if (!sku) return res.status(400).json({ error: 'sku is required' });
-  if (!quantity) return res.status(400).json({ error: 'quantity is required' });
+  if (!quantity || quantity <= 0) return res.status(400).json({ error: 'quantity must be a positive number' });
 
   try {
     const inventoryResponse = await fetch(`${process.env.INVENTORY_SERVICE_URL}/inventory/reserve`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sku, quantity }),
+      signal: AbortSignal.timeout(3000)
     });
 
     if (!inventoryResponse.ok) {
@@ -73,8 +74,8 @@ app.post('/orders', async (req, res) => {
     }
 
     const inventoryResponseData = await inventoryResponse.json();
-    amount = inventoryResponseData.price * quantity;
-    
+    const amount = inventoryResponseData.price * quantity;
+
     const orderResponseData = await pool.query(
     'INSERT INTO orders (amount, sku, quantity) VALUES ($1, $2, $3) RETURNING *',
     [amount, sku, quantity]

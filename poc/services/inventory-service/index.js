@@ -15,8 +15,11 @@ const pool = new Pool({
 
 app.post('/inventory/reserve', async (req, res) => {
   const { sku, quantity } = req.body;
+  if (!sku) return res.status(400).json({ error: 'sku is required' });
+  if (!quantity || quantity <= 0) return res.status(400).json({ error: 'quantity must be a positive number' });
 
-  const result = await pool.query(
+  try{
+    const result = await pool.query(
     'UPDATE inventory SET quantity = quantity - $1 WHERE sku = $2 AND quantity >= $1 RETURNING *',
     [quantity, sku]
   );
@@ -32,7 +35,13 @@ app.post('/inventory/reserve', async (req, res) => {
     return res.status(404).json({ error: 'SKU not found' });
   }
 
-  return res.status(409).json({ error: 'Insufficient stock' });
+  return res.status(409).json({ error: 'Insufficient stock' }); 
+  }
+  catch (err) {
+    console.error(err);
+    res.status(503).json({ error: 'Service Unavailable' });
+    return;
+  }
 });
 
 app.get('/inventory', async (req, res) => {
