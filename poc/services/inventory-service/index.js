@@ -18,29 +18,52 @@ app.post('/inventory/reserve', async (req, res) => {
   if (!sku) return res.status(400).json({ error: 'sku is required' });
   if (!quantity || quantity <= 0) return res.status(400).json({ error: 'quantity must be a positive number' });
 
-  try{
+  try {
+    // Atomic: the check and the move happen in one statement
     const result = await pool.query(
-    'UPDATE inventory SET quantity = quantity - $1 WHERE sku = $2 AND quantity >= $1 RETURNING *',
-    [quantity, sku]
-  );
+      `UPDATE inventory
+         SET quantity = quantity - $1,
+             reserved = reserved + $1
+       WHERE sku = $2 AND quantity >= $1
+       RETURNING *`,
+      [quantity, sku]
+    );
 
-  if (result.rows.length > 0) {
-    return res.status(200).json(result.rows[0]); // success
-  }
+    if (result.rows.length > 0) return res.status(200).json(result.rows[0]);
 
-  //Zero rows... Now to check why?
-  const check = await pool.query('SELECT * FROM inventory WHERE sku = $1', [sku]);
-
-  if (check.rows.length === 0) {
-    return res.status(404).json({ error: 'SKU not found' });
-  }
-
-  return res.status(409).json({ error: 'Insufficient stock' }); 
-  }
-  catch (err) {
+    // Zero rows: diagnose only, after the atomic decision was made
+    const check = await pool.query('SELECT 1 FROM inventory WHERE sku = $1', [sku]);
+    if (check.rows.length === 0) return res.status(404).json({ error: 'SKU not found' });
+    return res.status(409).json({ error: 'Insufficient stock' });
+  } catch (err) {
     console.error(err);
-    res.status(503).json({ error: 'Service Unavailable' });
-    return;
+    return res.status(503).json({ error: 'Service Unavailable' });
+  }
+});
+
+app.post('/inventory/commit', async (req, res) => {
+  const { sku, quantity } = req.body;
+  if (!sku) return res.status(400).json({ error: 'sku is required' });
+  if (!quantity || quantity <= 0) return res.status(400).json({ error: 'quantity must be a positive number' });
+
+  try {
+    // Finalize: reserved units leave the system; guard prevents committing more than is held
+    const result = await pool.query(
+      `UPDATE inventory
+         SET reserved = reserved - $1
+       WHERE sku = $2 AND reserved >= $1
+       RETURNING *`,
+      [quantity, sku]
+    );
+
+    if (result.rows.length > 0) return res.status(200).json(result.rows[0]);
+
+    const check = await pool.query('SELECT 1 FROM inventory WHERE sku = $1', [sku]);
+    if (check.rows.length === 0) return res.status(404).json({ error: 'SKU not found' });
+    return res.status(409).json({ error: 'Not enough reserved stock to commit' });
+  } catch (err) {
+    console.error(err);
+    return res.status(503).json({ error: 'Service Unavailable' });
   }
 });
 
@@ -75,6 +98,34 @@ app.post('/inventory', async (req, res) => {
     }
     console.error(err);
     res.status(500).json({ error: 'Failed to insert item' });
+  }
+});
+
+app.post('/inventory/release', async (req, res) => {
+  const { sku, quantity } = req.body;
+  if (!sku) return res.status(400).json({ error: 'sku is required' });
+  if (!quantity || quantity <= 0) return res.status(400).json({ error: 'quantity must be a positive number' });
+
+  try {
+    // Compensation: return held units to available stock.
+    // The guard prevents releasing more than is currently reserved.
+    const result = await pool.query(
+      `UPDATE inventory
+         SET quantity = quantity + $1,
+             reserved = reserved - $1
+       WHERE sku = $2 AND reserved >= $1
+       RETURNING *`,
+      [quantity, sku]
+    );
+
+    if (result.rows.length > 0) return res.status(200).json(result.rows[0]);
+
+    const check = await pool.query('SELECT 1 FROM inventory WHERE sku = $1', [sku]);
+    if (check.rows.length === 0) return res.status(404).json({ error: 'SKU not found' });
+    return res.status(409).json({ error: 'Not enough reserved stock to release' });
+  } catch (err) {
+    console.error(err);
+    return res.status(503).json({ error: 'Service Unavailable' });
   }
 });
 

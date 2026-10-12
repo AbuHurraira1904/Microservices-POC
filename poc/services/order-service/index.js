@@ -1,4 +1,7 @@
 require('dotenv').config();
+const grpc = require('@grpc/grpc-js');
+const paymentClient = require('./paymentClient');   // keep this after dotenv.config()
+
 const express = require('express');
 const { Pool } = require('pg');
 
@@ -13,44 +16,17 @@ const pool = new Pool({
   database: process.env.DB_NAME,
 });
 
-// // PROBLEM: RACE CONDITION
-// // Create a new order
-// app.post('/orders', async (req, res) => {
-//   const { amount, sku, quantity } = req.body;
-//   if (!amount) return res.status(400).json({ error: 'amount is required' });
-//   if (!sku) return res.status(400).json({ error: 'sku is required' });
-//   if (!quantity) return res.status(400).json({ error: 'quantity is required' });
-
-//   try {
-//     //call inventory service to get the inventory for the sku and check if the quantity is available
-//     const inventoryResponse = await fetch(`${process.env.INVENTORY_SERVICE_URL}/inventory/${sku}`)
-
-//     if (inventoryResponse.status === 404) {
-//       return res.status(404).json({ error: 'SKU not found in inventory' });
-//     }
-
-//     if (!inventoryResponse.ok) {
-//       return res.status(inventoryResponse.status).json({ error: 'Inventory service error' });
-//     }
-
-//     const inventoryData = await inventoryResponse.json();
-//     if (inventoryData.quantity < quantity) {
-//       return res.status(400).json({ error: 'Insufficient inventory' });
-//     }
-    
-//     const result = await pool.query(
-//     'INSERT INTO orders (amount, sku, quantity) VALUES ($1, $2, $3) RETURNING *',
-//     [amount, sku, quantity]
-//     );
-
-//   res.status(201).json(result.rows[0]);
-//   }
-//   catch (err) {
-//     console.error(err);
-//     res.status(503).json({ error: 'Service Unavailable' });
-//     return;
-//   }
-// });
+// Calls Inventory's commit/release. Throws on any non-2xx so failures are never silent.
+async function callInventory(action, sku, quantity) {
+  const response = await fetch(`${process.env.INVENTORY_SERVICE_URL}/inventory/${action}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sku, quantity }),
+    signal: AbortSignal.timeout(3000),
+  });
+  if (!response.ok) throw new Error(`inventory ${action} failed with status ${response.status}`);
+  return response.json();
+}
 
 // Create a new order
 app.post('/orders', async (req, res) => {
@@ -58,38 +34,85 @@ app.post('/orders', async (req, res) => {
   if (!sku) return res.status(400).json({ error: 'sku is required' });
   if (!quantity || quantity <= 0) return res.status(400).json({ error: 'quantity must be a positive number' });
 
+  let reserved = false;   // stock is currently held and must be released on failure
+  let paid = false;       // payment was approved, so stock must NOT be released
+  let orderId = null;
+
   try {
-    const inventoryResponse = await fetch(`${process.env.INVENTORY_SERVICE_URL}/inventory/reserve`, {
+    // 1. Reserve stock (REST). Pass Inventory's 404/409 through to the client.
+    const reserveResponse = await fetch(`${process.env.INVENTORY_SERVICE_URL}/inventory/reserve`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sku, quantity }),
-      signal: AbortSignal.timeout(3000)
+      signal: AbortSignal.timeout(3000),
     });
 
-    if (!inventoryResponse.ok) {
-      const errorData = await inventoryResponse.json();
-      return res.status(inventoryResponse.status).json({
-        error: errorData.error || 'Failed to update inventory'
+    if (!reserveResponse.ok) {
+      const errorData = await reserveResponse.json().catch(() => ({}));
+      return res.status(reserveResponse.status).json({
+        error: errorData.error || 'Failed to reserve inventory',
       });
     }
+    reserved = true;
 
-    const inventoryResponseData = await inventoryResponse.json();
-    const amount = inventoryResponseData.price * quantity;
+    // 2. Amount is derived server-side from Inventory's price
+    const { price } = await reserveResponse.json();
+    const amount = price * quantity;
 
-    const orderResponseData = await pool.query(
-    'INSERT INTO orders (amount, sku, quantity) VALUES ($1, $2, $3) RETURNING *',
-    [amount, sku, quantity]
+    // 3. Record the order as PENDING (Payment needs an order_id)
+    const inserted = await pool.query(
+      "INSERT INTO orders (amount, sku, quantity, status) VALUES ($1, $2, $3, 'PENDING') RETURNING id",
+      [amount, sku, quantity]
+    );
+    orderId = inserted.rows[0].id;
+
+    // 4. Charge (gRPC over mTLS)
+    const payment = await paymentClient.charge(orderId, amount);
+
+    // 5a. Declined: definite "no" -> compensate
+    if (!payment.approved) {
+      await callInventory('release', sku, quantity);
+      reserved = false;
+      await pool.query("UPDATE orders SET status = 'FAILED' WHERE id = $1", [orderId]);
+      return res.status(402).json({ error: 'Payment declined', reason: payment.reason });
+    }
+
+    // 5b. Approved: finalize the sale
+    paid = true;
+    await callInventory('commit', sku, quantity);
+    reserved = false;
+
+    const confirmed = await pool.query(
+      "UPDATE orders SET status = 'CONFIRMED', transaction_id = $1 WHERE id = $2 RETURNING *",
+      [payment.transaction_id, orderId]
     );
 
-    res.status(201).json({
-      message: 'Order placed and stock updated. Price of the order is $' + amount,
-      order: orderResponseData.rows[0],
+    return res.status(201).json({
+      message: 'Order placed. Price of the order is $' + amount,
+      order: confirmed.rows[0],
     });
-  }
-  catch (err) {
+  } catch (err) {
     console.error(err);
-    res.status(503).json({ error: 'Service Unavailable' });
-    return;
+
+    // Money was taken but finalization failed: releasing stock here would be wrong.
+    // Flag the order for reconciliation instead.
+    if (paid) {
+      if (orderId) {
+        await pool.query("UPDATE orders SET status = 'PAID_UNRECONCILED' WHERE id = $1", [orderId])
+          .catch(console.error);
+      }
+      return res.status(500).json({ error: 'Payment taken but order could not be finalized', orderId });
+    }
+
+    // Otherwise undo what we did
+    if (reserved) await callInventory('release', sku, quantity).catch(console.error);
+    if (orderId) {
+      await pool.query("UPDATE orders SET status = 'FAILED' WHERE id = $1", [orderId])
+        .catch(console.error);
+    }
+
+    const status = err.code === grpc.status.DEADLINE_EXCEEDED ? 504 : 503;
+    return res.status(status).json({ error: 'Service Unavailable' });
   }
 });
 
