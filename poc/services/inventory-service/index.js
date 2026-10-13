@@ -1,6 +1,13 @@
 require('dotenv').config();
 const express = require('express');
 const { Pool } = require('pg');
+const { requireRole } = require('./auth');   // keep this after dotenv.config()
+
+// Who may call what:
+//   service  = the Order service (reserve / commit / release)
+//   admin    = a person managing stock (create items)
+//   any valid token (customer, admin, service) may read stock levels
+const READERS = ['customer', 'admin', 'service'];
 
 const app = express();
 app.use(express.json());
@@ -13,7 +20,7 @@ const pool = new Pool({
   database: process.env.DB_NAME,
 });
 
-app.post('/inventory/reserve', async (req, res) => {
+app.post('/inventory/reserve', requireRole('service'), async (req, res) => {
   const { sku, quantity } = req.body;
   if (!sku) return res.status(400).json({ error: 'sku is required' });
   if (!quantity || quantity <= 0) return res.status(400).json({ error: 'quantity must be a positive number' });
@@ -41,7 +48,7 @@ app.post('/inventory/reserve', async (req, res) => {
   }
 });
 
-app.post('/inventory/commit', async (req, res) => {
+app.post('/inventory/commit', requireRole('service'), async (req, res) => {
   const { sku, quantity } = req.body;
   if (!sku) return res.status(400).json({ error: 'sku is required' });
   if (!quantity || quantity <= 0) return res.status(400).json({ error: 'quantity must be a positive number' });
@@ -67,19 +74,19 @@ app.post('/inventory/commit', async (req, res) => {
   }
 });
 
-app.get('/inventory', async (req, res) => {
+app.get('/inventory', requireRole(...READERS), async (req, res) => {
   const result = await pool.query('SELECT * FROM inventory');
   if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });
   res.json(result.rows);
 });
 
-app.get('/inventory/:sku', async (req, res) => {
+app.get('/inventory/:sku', requireRole(...READERS), async (req, res) => {
   const result = await pool.query('SELECT * FROM inventory WHERE sku = $1', [req.params.sku]);
   if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });
   res.json(result.rows[0]);
 });
 
-app.post('/inventory', async (req, res) => {
+app.post('/inventory', requireRole('admin'), async (req, res) => {
   const { sku, quantity, price } = req.body;
 
   if (!sku) return res.status(400).json({ error: 'sku is required' });
@@ -101,7 +108,7 @@ app.post('/inventory', async (req, res) => {
   }
 });
 
-app.post('/inventory/release', async (req, res) => {
+app.post('/inventory/release', requireRole('service'), async (req, res) => {
   const { sku, quantity } = req.body;
   if (!sku) return res.status(400).json({ error: 'sku is required' });
   if (!quantity || quantity <= 0) return res.status(400).json({ error: 'quantity must be a positive number' });
