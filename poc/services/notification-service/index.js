@@ -1,3 +1,21 @@
+// Notification service: a RabbitMQ consumer with a small Postgres table for
+// idempotency (no HTTP port).
+//
+// Reliability choices:
+//  - Durable named queue: messages wait here while this service is down.
+//  - Manual ack: a message is removed from the queue only after we finish with it.
+//    If we crash mid-processing, RabbitMQ redelivers it (at-least-once delivery).
+//  - prefetch(1): one unacknowledged message at a time, so work is not hoarded.
+//  - Idempotent consumer: each eventId is stored in Postgres (processed_events)
+//    in the same transaction as the work, so redelivered duplicates are skipped.
+//  - Dead-letter queue: a rejected message (unparseable, no eventId, or failing)
+//    is not discarded; the broker routes it to the DLQ, where it can be inspected.
+//
+// Known gaps: a real side effect (an email already sent) cannot be rolled back,
+// so true exactly-once effects need an idempotent downstream. A failure caused by
+// a temporary outage (for example Postgres down) is also dead-lettered; retry
+// with backoff is a deferred item.
+
 require('dotenv').config();
 const amqp = require('amqplib');
 const { Pool } = require('pg');
@@ -6,6 +24,9 @@ const URL = process.env.RABBITMQ_URL;
 const EXCHANGE = process.env.RABBITMQ_EXCHANGE || 'orders';
 const QUEUE = process.env.RABBITMQ_QUEUE || 'notification.orders';
 const BINDING = process.env.RABBITMQ_BINDING || 'order.*';
+// Dead-letter exchange and queue: where rejected messages are parked.
+const DLX = process.env.RABBITMQ_DLX || 'orders.dlx';
+const DLQ = process.env.RABBITMQ_DLQ || `${QUEUE}.dlq`;
 const DELAY_MS = Number(process.env.PROCESSING_DELAY_MS) || 0;
 // Demo helper: pause AFTER the database commit but BEFORE the ack, so you can
 // stop the service in the exact window where duplicates are born.
@@ -64,11 +85,29 @@ async function start() {
 
   // Must match the publisher's declaration exactly, or RabbitMQ rejects it.
   await channel.assertExchange(EXCHANGE, 'topic', { durable: true });
-  await channel.assertQueue(QUEUE, { durable: true });
+
+  // Dead-letter side. A fanout exchange sends every dead-lettered message to the
+  // DLQ whatever its routing key. Declared BEFORE the main queue, which refers to it.
+  await channel.assertExchange(DLX, 'fanout', { durable: true });
+  await channel.assertQueue(DLQ, { durable: true });
+  await channel.bindQueue(DLQ, DLX, '');
+
+  // Main queue. 'x-dead-letter-exchange' tells the broker: when a consumer
+  // rejects a message with nack(requeue=false), send it to the DLX instead of
+  // deleting it. NOTE: RabbitMQ refuses to redeclare an existing queue with
+  // different arguments, so an old "notification.orders" queue must be deleted
+  // once (management UI -> Queues) before this version can start.
+  await channel.assertQueue(QUEUE, {
+    durable: true,
+    arguments: { 'x-dead-letter-exchange': DLX },
+  });
   await channel.bindQueue(QUEUE, EXCHANGE, BINDING);
   await channel.prefetch(1);
 
-  console.log(`Notification service waiting on queue "${QUEUE}" (binding "${BINDING}")`);
+  console.log(
+    `Notification service waiting on queue "${QUEUE}" (binding "${BINDING}"), ` +
+    `rejected messages go to "${DLQ}"`
+  );
 
   await channel.consume(
     QUEUE,
@@ -79,14 +118,14 @@ async function start() {
       try {
         event = JSON.parse(msg.content.toString());
       } catch (err) {
-        console.error('[consumer] unparseable message, discarding:', err.message);
+        console.error('[consumer] unparseable message, dead-lettering:', err.message);
         channel.nack(msg, false, false);   // no requeue; would loop forever otherwise
         return;
       }
 
       // Without an eventId we cannot tell duplicates apart, so reject the message.
       if (!event || !event.eventId) {
-        console.error('[consumer] message has no eventId, discarding');
+        console.error('[consumer] message has no eventId, dead-lettering');
         channel.nack(msg, false, false);
         return;
       }
@@ -96,9 +135,10 @@ async function start() {
       //   stored, which means we have processed this event before.
       //   If the work throws, ROLLBACK removes the id again, so a retry is not
       //   mistaken for a duplicate.
-      const client = await pool.connect();
+      let client;
       let duplicate = false;
       try {
+        client = await pool.connect();   // inside the try: a database outage must not crash the consumer
         await client.query('BEGIN');
         const res = await client.query(
           'INSERT INTO processed_events (event_id) VALUES ($1) ON CONFLICT (event_id) DO NOTHING',
@@ -112,12 +152,12 @@ async function start() {
         }
         await client.query('COMMIT');
       } catch (err) {
-        await client.query('ROLLBACK').catch(() => {});
-        console.error(`[consumer] failed on eventId ${event.eventId}, discarding:`, err.message);
+        if (client) await client.query('ROLLBACK').catch(() => {});
+        console.error(`[consumer] failed on eventId ${event.eventId}, dead-lettering:`, err.message);
         channel.nack(msg, false, false);
         return;
       } finally {
-        client.release();
+        if (client) client.release();
       }
 
       if (duplicate) {
