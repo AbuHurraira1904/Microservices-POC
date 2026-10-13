@@ -1,7 +1,6 @@
 require('dotenv').config();
 const grpc = require('@grpc/grpc-js');
 const paymentClient = require('./paymentClient');   // keep this after dotenv.config()
-const { publishEvent } = require('./publisher');    // keep this after dotenv.config()
 const { ensureOutboxSchema, startRelay } = require('./outbox');   // keep this after dotenv.config()
 
 const express = require('express');
@@ -30,11 +29,30 @@ async function callInventory(action, sku, quantity) {
   return response.json();
 }
 
-async function emitEvent(type, payload) {
+// Writes the order's final status AND its event in ONE database transaction
+// (the transactional outbox). Either both are saved or neither is, so an order
+// outcome can never exist without its event. The relay in outbox.js publishes the
+// event to RabbitMQ afterwards, so a broker outage no longer affects this request.
+// Returns the updated order row. Throws if the transaction fails.
+async function finalizeOrder(orderId, status, transactionId, eventType, eventPayload) {
+  const client = await pool.connect();
   try {
-    await publishEvent(type, payload);
+    await client.query('BEGIN');
+    const updated = await client.query(
+      'UPDATE orders SET status = $1, transaction_id = $2 WHERE id = $3 RETURNING *',
+      [status, transactionId, orderId]
+    );
+    await client.query(
+      'INSERT INTO outbox_events (type, payload) VALUES ($1, $2)',
+      [eventType, eventPayload]
+    );
+    await client.query('COMMIT');
+    return updated.rows[0];
   } catch (err) {
-    console.error(`event ${type} for order ${payload.orderId} was NOT published:`, err.message);
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
   }
 }
 
@@ -83,9 +101,8 @@ app.post('/orders', async (req, res) => {
     if (!payment.approved) {
       await callInventory('release', sku, quantity);
       reserved = false;
-      await pool.query("UPDATE orders SET status = 'FAILED' WHERE id = $1", [orderId]);
-
-      await emitEvent('order.failed', { orderId, sku, quantity, amount, transactionId: null });
+      await finalizeOrder(orderId, 'FAILED', null, 'order.failed',
+        { orderId, sku, quantity, amount, transactionId: null });
 
       return res.status(402).json({ error: 'Payment declined', reason: payment.reason });
     }
@@ -95,18 +112,12 @@ app.post('/orders', async (req, res) => {
     await callInventory('commit', sku, quantity);
     reserved = false;
 
-    const confirmed = await pool.query(
-      "UPDATE orders SET status = 'CONFIRMED', transaction_id = $1 WHERE id = $2 RETURNING *",
-      [payment.transaction_id, orderId]
-    );
-
-    await emitEvent('order.confirmed', {
-    orderId, sku, quantity, amount, transactionId: payment.transaction_id,
-    });
+    const confirmedOrder = await finalizeOrder(orderId, 'CONFIRMED', payment.transaction_id, 'order.confirmed',
+      { orderId, sku, quantity, amount, transactionId: payment.transaction_id });
 
     return res.status(201).json({
       message: 'Order placed. Price of the order is $' + amount,
-      order: confirmed.rows[0],
+      order: confirmedOrder,
     });
   } catch (err) {
     console.error(err);
@@ -124,9 +135,9 @@ app.post('/orders', async (req, res) => {
     // Otherwise undo what we did
     if (reserved) await callInventory('release', sku, quantity).catch(console.error);
     if (orderId) {
-      await pool.query("UPDATE orders SET status = 'FAILED' WHERE id = $1", [orderId])
+      await finalizeOrder(orderId, 'FAILED', null, 'order.failed',
+        { orderId, sku, quantity, amount: null, transactionId: null })
         .catch(console.error);
-      await emitEvent('order.failed', { orderId, sku, quantity, amount: null, transactionId: null });
     }
 
     const status = err.code === grpc.status.DEADLINE_EXCEEDED ? 504 : 503;
