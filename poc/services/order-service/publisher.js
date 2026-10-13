@@ -1,18 +1,3 @@
-// RabbitMQ publisher for the Order service.
-//
-// Reliability choices (each one is a talking point for the guide):
-//  - Durable topic exchange: survives a broker restart.
-//  - Persistent messages (persistent: true): written to disk by the broker.
-//  - Confirm channel: the broker acknowledges every message. publish() only
-//    resolves once the broker has confirmed it, so a lost event is never silent.
-//  - Lazy connect + reconnect: if the connection drops, the next publish reconnects.
-//
-// Known gap (kept visible on purpose): the DB update and the publish are two
-// separate writes (the "dual-write problem"). If the process dies between them,
-// the order is saved but the event is never sent. The outbox pattern fixes this.
-//
-// Keep this module's require() after dotenv.config() in index.js.
-
 const amqp = require('amqplib');
 const { randomUUID } = require('crypto');
 

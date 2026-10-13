@@ -1,6 +1,7 @@
 require('dotenv').config();
 const grpc = require('@grpc/grpc-js');
 const paymentClient = require('./paymentClient');   // keep this after dotenv.config()
+const { publishEvent } = require('./publisher');    // keep this after dotenv.config()
 
 const express = require('express');
 const { Pool } = require('pg');
@@ -26,6 +27,14 @@ async function callInventory(action, sku, quantity) {
   });
   if (!response.ok) throw new Error(`inventory ${action} failed with status ${response.status}`);
   return response.json();
+}
+
+async function emitEvent(type, payload) {
+  try {
+    await publishEvent(type, payload);
+  } catch (err) {
+    console.error(`event ${type} for order ${payload.orderId} was NOT published:`, err.message);
+  }
 }
 
 // Create a new order
@@ -74,6 +83,9 @@ app.post('/orders', async (req, res) => {
       await callInventory('release', sku, quantity);
       reserved = false;
       await pool.query("UPDATE orders SET status = 'FAILED' WHERE id = $1", [orderId]);
+
+      await emitEvent('order.failed', { orderId, sku, quantity, amount, transactionId: null });
+
       return res.status(402).json({ error: 'Payment declined', reason: payment.reason });
     }
 
@@ -86,6 +98,10 @@ app.post('/orders', async (req, res) => {
       "UPDATE orders SET status = 'CONFIRMED', transaction_id = $1 WHERE id = $2 RETURNING *",
       [payment.transaction_id, orderId]
     );
+
+    await emitEvent('order.confirmed', {
+    orderId, sku, quantity, amount, transactionId: payment.transaction_id,
+    });
 
     return res.status(201).json({
       message: 'Order placed. Price of the order is $' + amount,
@@ -109,6 +125,7 @@ app.post('/orders', async (req, res) => {
     if (orderId) {
       await pool.query("UPDATE orders SET status = 'FAILED' WHERE id = $1", [orderId])
         .catch(console.error);
+      await emitEvent('order.failed', { orderId, sku, quantity, amount: null, transactionId: null });
     }
 
     const status = err.code === grpc.status.DEADLINE_EXCEEDED ? 504 : 503;

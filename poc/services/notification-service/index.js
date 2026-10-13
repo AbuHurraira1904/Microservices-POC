@@ -1,16 +1,3 @@
-// Notification service: a pure RabbitMQ consumer (no HTTP port, no database).
-//
-// Reliability choices:
-//  - Durable named queue: messages wait here while this service is down.
-//  - Manual ack: a message is removed from the queue only after we finish with it.
-//    If we crash mid-processing, RabbitMQ redelivers it (at-least-once delivery).
-//  - prefetch(1): one unacknowledged message at a time, so work is not hoarded.
-//  - eventId logged on every receipt: duplicates after a redelivery are visible.
-//    (Idempotent handling is the next roadmap item; not implemented yet.)
-//
-// Known gap: a malformed or failing message is rejected WITHOUT requeue and is
-// therefore discarded. A dead-letter queue (roadmap item 5) is the proper fix.
-
 require('dotenv').config();
 const amqp = require('amqplib');
 
