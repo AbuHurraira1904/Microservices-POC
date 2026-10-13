@@ -2,6 +2,7 @@ require('dotenv').config();
 const grpc = require('@grpc/grpc-js');
 const paymentClient = require('./paymentClient');   // keep this after dotenv.config()
 const { publishEvent } = require('./publisher');    // keep this after dotenv.config()
+const { ensureOutboxSchema, startRelay } = require('./outbox');   // keep this after dotenv.config()
 
 const express = require('express');
 const { Pool } = require('pg');
@@ -147,4 +148,14 @@ app.get('/orders/:id', async (req, res) => {
 });
 
 const PORT = 4001;
-app.listen(PORT, () => console.log(`Order service on port ${PORT}`));
+
+// Create the outbox table, start the relay, then accept requests.
+ensureOutboxSchema(pool)
+  .then(() => {
+    startRelay(pool);
+    app.listen(PORT, () => console.log(`Order service on port ${PORT}`));
+  })
+  .catch((err) => {
+    console.error('Failed to start order service:', err.message);
+    process.exit(1);
+  });

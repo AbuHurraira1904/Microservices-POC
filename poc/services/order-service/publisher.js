@@ -7,9 +7,12 @@
 //    resolves once the broker has confirmed it, so a lost event is never silent.
 //  - Lazy connect + reconnect: if the connection drops, the next publish reconnects.
 //
-// Known gap (kept visible on purpose): the DB update and the publish are two
-// separate writes (the "dual-write problem"). If the process dies between them,
-// the order is saved but the event is never sent. The outbox pattern fixes this.
+// Events are NOT published from the request. Order stores each event in the
+// outbox_events table in the same DB transaction as the order outcome, and a relay
+// loop (outbox.js) publishes it later with its stored eventId. That closes the
+// "dual-write problem": a crash can no longer leave a saved order without its event.
+// A crash after publishing but before the relay marks the row sends the SAME eventId
+// again, which the consumer's duplicate check (processed_events) ignores.
 //
 // Keep this module's require() after dotenv.config() in index.js.
 
@@ -52,13 +55,16 @@ function getChannel() {
 
 // Publishes one event. Resolves with the full event once the broker confirms it.
 // Rejects if the broker is unreachable or nacks the message. The caller decides
-// what to do (in Order: log it, and do not change the HTTP response).
-async function publishEvent(type, payload) {
+// what to do (the outbox relay leaves the row unpublished and retries later).
+//
+// options.eventId / options.timestamp: pass the values stored in the outbox so a
+// re-publish carries the SAME eventId (that is what lets the consumer dedupe it).
+async function publishEvent(type, payload, options = {}) {
   const event = {
-    eventId: randomUUID(),
+    eventId: options.eventId || randomUUID(),
     type,
     ...payload,   // orderId, sku, quantity, amount, transactionId
-    timestamp: new Date().toISOString(),
+    timestamp: options.timestamp || new Date().toISOString(),
   };
 
   const ch = await getChannel();
