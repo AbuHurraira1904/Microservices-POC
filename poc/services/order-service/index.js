@@ -2,6 +2,8 @@ require('dotenv').config();
 const grpc = require('@grpc/grpc-js');
 const paymentClient = require('./paymentClient');   // keep this after dotenv.config()
 const { ensureOutboxSchema, startRelay } = require('./outbox');   // keep this after dotenv.config()
+const { signUserToken, mintServiceToken, requireRole } = require('./auth');   // keep this after dotenv.config()
+const crypto = require('crypto');
 
 const express = require('express');
 const { Pool } = require('pg');
@@ -21,7 +23,7 @@ const pool = new Pool({
 async function callInventory(action, sku, quantity) {
   const response = await fetch(`${process.env.INVENTORY_SERVICE_URL}/inventory/${action}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${mintServiceToken()}` },
     body: JSON.stringify({ sku, quantity }),
     signal: AbortSignal.timeout(3000),
   });
@@ -56,8 +58,33 @@ async function finalizeOrder(orderId, status, transactionId, eventType, eventPay
   }
 }
 
+// ---- Demo login (STUB) ----------------------------------------------------
+// Two hardcoded demo users; passwords come from .env, never from the code.
+// A real system would use a separate identity provider. If a password is not set
+// in .env, that user simply cannot log in.
+const DEMO_USERS = {
+  customer: { password: process.env.DEMO_CUSTOMER_PASSWORD, role: 'customer' },
+  admin: { password: process.env.DEMO_ADMIN_PASSWORD, role: 'admin' },
+};
+
+// Constant-time comparison so response timing does not leak the password.
+function passwordMatches(given, expected) {
+  const a = crypto.createHash('sha256').update(String(given)).digest();
+  const b = crypto.createHash('sha256').update(String(expected)).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+app.post('/auth/login', (req, res) => {
+  const { username, password } = req.body || {};
+  const user = Object.hasOwn(DEMO_USERS, username) ? DEMO_USERS[username] : null;
+  if (!user || !user.password || !passwordMatches(password, user.password)) {
+    return res.status(401).json({ error: 'invalid credentials' });
+  }
+  res.json({ token: signUserToken(username, user.role), expiresIn: '1h' });
+});
+
 // Create a new order
-app.post('/orders', async (req, res) => {
+app.post('/orders', requireRole('customer', 'admin'), async (req, res) => {
   const { sku, quantity } = req.body;
   if (!sku) return res.status(400).json({ error: 'sku is required' });
   if (!quantity || quantity <= 0) return res.status(400).json({ error: 'quantity must be a positive number' });
@@ -70,7 +97,7 @@ app.post('/orders', async (req, res) => {
     // 1. Reserve stock (REST). Pass Inventory's 404/409 through to the client.
     const reserveResponse = await fetch(`${process.env.INVENTORY_SERVICE_URL}/inventory/reserve`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${mintServiceToken()}` },
       body: JSON.stringify({ sku, quantity }),
       signal: AbortSignal.timeout(3000),
     });
@@ -146,13 +173,13 @@ app.post('/orders', async (req, res) => {
 });
 
 // Get all orders
-app.get('/orders', async (req, res) => {
+app.get('/orders', requireRole('admin'), async (req, res) => {
   const result = await pool.query('SELECT * FROM orders');
   res.json(result.rows);
 });
 
 // Get a specific order by ID
-app.get('/orders/:id', async (req, res) => {
+app.get('/orders/:id', requireRole('customer', 'admin'), async (req, res) => {
   const result = await pool.query('SELECT * FROM orders WHERE id = $1', [req.params.id]);
   if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });
   res.json(result.rows[0]);
@@ -169,4 +196,4 @@ ensureOutboxSchema(pool)
   .catch((err) => {
     console.error('Failed to start order service:', err.message);
     process.exit(1);
-  });
+  });
