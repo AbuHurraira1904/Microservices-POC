@@ -1,0 +1,19 @@
+{
+  "name": "notification-service",
+  "version": "1.0.0",
+  "description": "Consumes order events from RabbitMQ and sends (fake) receipts",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "amqplib": "^2.2.0",
+    "dotenv": "^18.0.6"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}
