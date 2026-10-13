@@ -73,8 +73,13 @@ async function ensureSchema() {
 }
 
 async function start() {
-  await ensureSchema();
-  const connection = await amqp.connect(URL);
+  // Label each startup step so a failure says WHICH dependency was unreachable.
+  await ensureSchema().catch((err) => {
+    throw new Error(`Postgres (${process.env.DB_HOST}:${process.env.DB_PORT}) unreachable: ${err.message}`);
+  });
+  const connection = await amqp.connect(URL).catch((err) => {
+    throw new Error(`RabbitMQ (${URL.replace(/\/\/.*@/, '//***@')}) unreachable: ${err.message}`);
+  });
   connection.on('error', (err) => console.error('[consumer] connection error:', err.message));
   connection.on('close', () => {
     console.error('[consumer] connection closed; exiting so a supervisor can restart us');
