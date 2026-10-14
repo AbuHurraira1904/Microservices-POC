@@ -196,4 +196,4 @@ ensureOutboxSchema(pool)
   .catch((err) => {
     console.error('Failed to start order service:', err.message);
     process.exit(1);
-  });
+  });
