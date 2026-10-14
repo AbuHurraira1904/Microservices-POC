@@ -1,8 +1,62 @@
+# =============================================================================
+# INFRASTRUCTURE FOR THE DEMO  (Postgres and RabbitMQ)
+# =============================================================================
+# Start with:   docker compose up -d        Stop with:   docker compose down
+#
+# Only the two shared pieces of infrastructure run in Docker. The four
+# services (Order, Inventory, Payment, Notification) run directly on your
+# machine with `node`. Running them in Docker as well is a possible next step
+# (it needs a Dockerfile per service and the mTLS certificates for Payment to
+# be valid for the container names).
+#
+# Words used in this file
+#   - Image: the packaged program Docker runs ("postgres:16" = PostgreSQL
+#     version 16).
+#   - Container: one running copy of an image.
+#   - Volume: storage that outlives the container.
+#   - Port mapping "5432:5432": "machine port : container port". It makes the
+#     program inside the container reachable from your machine.
+#
+# Decisions made here, and why
+#   - PostgreSQL stores the data: orders, stock, the outbox of unsent events
+#     and the list of events Notification has handled.
+#   - RabbitMQ carries the events between services (the "message broker"). The
+#     "-management" image adds a web page (port 15672) to look at queues and
+#     messages, which the demos use, for example to see waiting messages and
+#     the dead-letter queue.
+#   - A named volume (pg_data) keeps the database when the container is
+#     removed or recreated. RabbitMQ has no volume here, so its queues are lost
+#     if the container is REMOVED (a plain restart keeps them).
+#   - `restart: unless-stopped` brings both back after a reboot or crash.
+#   - Fixed container_name values (poc-postgres, poc-rabbitmq) make commands
+#     such as `docker exec poc-postgres ...` and `docker stop poc-rabbitmq`
+#     easy to type in the demos.
+#   - All services share ONE database (poc_db) to keep the demo small.
+#
+# PRODUCTION CHANGES (what a full system would do differently)
+#   - Passwords are visible here and are the same for everyone who reads this
+#     file; real systems inject them from a secrets store and never commit them.
+#   - Do not publish database and broker ports to the whole machine/network. Put
+#     the services on a private network and expose only what customers need.
+#   - Each microservice owns its own database (or schema) and its own login, and
+#     no other service reads it. A shared database couples the services
+#     together, which defeats the point of separating them.
+#   - Use managed or clustered versions (replicated Postgres, a RabbitMQ
+#     cluster with replicated queues), with backups that are tested by restoring.
+#   - Pin exact image versions (e.g. postgres:16.4); "postgres:16" and
+#     "rabbitmq:3-management" move to newer releases over time.
+#   - Add health checks and make services start only when their dependencies
+#     are ready; enable TLS on both Postgres and RabbitMQ.
+#   - Add the application services to this file (or use Kubernetes).
+# =============================================================================
+
 services:
   postgres:
     image: postgres:16
     container_name: poc-postgres
     restart: unless-stopped
+    # Creates this user, password and empty database the first time the volume
+    # is empty. Changing these later has no effect on an existing volume.
     environment:
       POSTGRES_USER: poc
       POSTGRES_PASSWORD: poc_password
@@ -19,9 +73,11 @@ services:
     ports:
       - "5672:5672"    # broker
       - "15672:15672"  # management UI
+    # Login for both the services and the management web page.
     environment:
       RABBITMQ_DEFAULT_USER: poc
       RABBITMQ_DEFAULT_PASS: poc_password
 
+# Declares the named volume used by postgres above.
 volumes:
   pg_data:
