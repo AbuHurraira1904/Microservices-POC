@@ -1,18 +1,60 @@
+// =============================================================================
+// PAYMENT CONTRACT
+// =============================================================================
+// The agreement between the Order service (the caller) and the Payment service
+// (the provider): which operations exist, what a request must contain, and
+// what the answer looks like. Both services load THIS one file, so they cannot
+// drift apart. If one side sends a field of the wrong type, gRPC reports it
+// instead of the bug appearing later as a strange result.
+//
+// This file is written in "Protocol Buffers" (proto3), the description language
+// of gRPC. Messages are sent in a compact binary form, not as text like JSON.
+//
+// Rule that matters when changing this file: every field has a NUMBER (= 1, = 2
+// ...). The number, not the name, identifies the field on the wire. Never
+// reuse or renumber a field that has been in use; add new fields with new
+// numbers. That is how old and new versions of a service stay compatible.
+//
+// PRODUCTION CHANGES (what a full system would do differently)
+//   - Send an idempotency key with each charge (a unique string per payment
+//     attempt) so a retry can never charge twice.
+//   - Send the amount as whole minor units (an integer number of cents) plus a
+//     currency code. "double" is a binary fraction and cannot represent many
+//     decimal amounts exactly, which is unacceptable for money.
+//   - Use a 64-bit or string order id (int32 runs out at about 2 billion).
+//   - Return a structured result (a status code plus a reason code, e.g.
+//     INSUFFICIENT_FUNDS, CARD_EXPIRED) instead of free text, and add
+//     operations such as Refund and GetPaymentStatus.
+//   - Keep the contract in one shared place and check compatibility
+//     automatically in the build.
+// =============================================================================
+
 syntax = "proto3";
 
 package payment;
 
+// The Payment service offers one operation. "Charge" takes a ChargeRequest and
+// returns a ChargeResponse.
 service PaymentService {
   rpc Charge (ChargeRequest) returns (ChargeResponse);
 }
 
+// What the Order service sends.
 message ChargeRequest {
+  // The order this charge belongs to. Payment only logs it today; it keeps no
+  // record of charges.
   int32 order_id = 1;
+  // How much to charge. The caller computes it on the server from the price in
+  // Inventory; a customer never supplies it.
   double amount = 2;
 }
 
+// What Payment answers. A decline is a normal answer (approved = false), not
+// an error; errors are reserved for broken requests and broken systems.
 message ChargeResponse {
+  // true = money taken, false = declined.
   bool approved = 1;
+  // Unique reference for this charge (the "receipt number").
   string transaction_id = 2;
   string reason = 3;   // populated only when approved = false
 }
